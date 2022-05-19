@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use std::ffi::{CString, CStr};
+use std::ffi::{CStr, CString};
 use windows::core::{PCSTR, PSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Security::*;
@@ -66,7 +66,7 @@ pub struct PE {
 }
 
 pub trait Driver {
-    fn enable_driver_load_privilege() -> Result<(), &'static str> {
+    fn enable_driver_load_privilege() -> Option<()> {
         let mut tp = TOKEN_PRIVILEGES::default();
         let mut luid = LUID::default();
         let mut token = HANDLE::default();
@@ -74,9 +74,9 @@ pub trait Driver {
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) }
             == false
         {
-            return Err("Could not open process token");
+            panic!("Could not open process token");
         }
-        
+
         let priv_name = CString::new(SE_LOAD_DRIVER_NAME).unwrap();
         if unsafe {
             LookupPrivilegeValueA(
@@ -86,7 +86,7 @@ pub trait Driver {
             )
         } == false
         {
-            return Err("Could not find LUID of the driver load privilege.");
+            panic!("Could not find LUID of the driver load privilege");
         }
 
         tp.PrivilegeCount = 1;
@@ -104,27 +104,27 @@ pub trait Driver {
             )
         } == false
         {
-            return Err("Could not adjust token's privileges");
+            panic!("Could not adjust token's privileges");
         }
 
         unsafe { CloseHandle(token) };
 
-        Ok(())
+        Some(())
     }
 
-    fn load(&mut self, driver_name: String) -> Result<(), &'static str>;
-    fn unload(&self) -> Result<(), &'static str>;
+    fn load(&mut self, driver_name: &str) -> Option<()>;
+    fn unload(&self) -> Option<()>;
 }
 
 impl PE {
-    pub fn from_disk(path: &String) -> Result<Self, String> {
+    pub fn from_disk(path: &String) -> Option<Self> {
         let mut image_bytes = std::fs::read(path).unwrap();
         let pre_dos_header = unsafe {
             core::mem::transmute::<*const u8, *const IMAGE_DOS_HEADER>(image_bytes.as_ptr()).read()
         };
 
         if u32::from(pre_dos_header.e_magic) != IMAGE_DOS_SIGNATURE {
-            return Err("image signature corrupt".to_string());
+            panic!("image signature corrupt");
         }
 
         let pre_nt_headers = unsafe {
@@ -136,7 +136,7 @@ impl PE {
             .read()
         };
         if pre_nt_headers.Signature != IMAGE_NT_SIGNATURE {
-            return Err("image signature corrupt".to_string());
+            panic!("image signature corrupt");
         }
 
         let image_size = pre_nt_headers.OptionalHeader.SizeOfImage as usize;
@@ -197,7 +197,7 @@ impl PE {
             core::mem::transmute::<*const c_void, *const IMAGE_DOS_HEADER>(image_base).read()
         };
         if u32::from(dos_header.e_magic) != IMAGE_DOS_SIGNATURE {
-            return Err("Image signature corrupt".to_string());
+            panic!("image signature corrupt");
         }
 
         let nt_headers = unsafe {
@@ -207,7 +207,7 @@ impl PE {
             .read()
         };
         if nt_headers.Signature != IMAGE_NT_SIGNATURE {
-            return Err("Image signature corrupt".to_string());
+            panic!("image signature corrupt");
         }
 
         let file_header = nt_headers.FileHeader;
@@ -259,7 +259,7 @@ impl PE {
             }
         };
 
-        Ok(PE {
+        Some(PE {
             name: image_name,
             path: path.clone(),
             size: image_size,
@@ -295,16 +295,16 @@ impl Drop for PE {
 }
 
 impl Driver for PE {
-    fn load(&mut self, driver_name: String) -> Result<(), &'static str> {
+    fn load(&mut self, driver_name: &str) -> Option<()> {
         if self.path.is_empty() {
-            return Err("Driver path is empty");
+            panic!("Driver path is empty");
         }
 
-        if let Err(e) = Self::enable_driver_load_privilege() {
-            return Err(e);
+        if let None = Self::enable_driver_load_privilege() {
+            panic!("Could not enable driver load privilege");
         }
 
-        self.provided_driver_name = driver_name;
+        self.provided_driver_name = driver_name.to_string();
 
         let service_mgr = unsafe {
             ScHandle::from_raw_handle(
@@ -317,7 +317,7 @@ impl Driver for PE {
             )
         };
         if service_mgr.raw().is_invalid() {
-            return Err("Could not open handle to service manager");
+            panic!("Could not open handle to service manager");
         }
 
         let mut service_ddk = unsafe {
@@ -341,7 +341,7 @@ impl Driver for PE {
             )
         };
         if service_ddk.raw().is_invalid() {
-            return Err("Could not create service for the driver");
+            panic!("Could not create service for the driver");
         }
 
         service_ddk.reset(unsafe {
@@ -353,22 +353,22 @@ impl Driver for PE {
             .unwrap()
         });
         if service_ddk.raw().is_invalid() {
-            return Err("Could not open handle to created service");
+            panic!("Could not open handle to create service");
         }
 
         let started = unsafe { StartServiceA(service_ddk.raw(), &[]) };
         if !started.as_bool() {
-            return Err("Could not start created service");
+            panic!("Could not start created service");
         }
 
-        Ok(())
+        Some(())
     }
 
-    fn unload(&self) -> Result<(), &'static str> {
+    fn unload(&self) -> Option<()> {
         let mut sstatus = SERVICE_STATUS::default();
 
         if self.provided_driver_name.is_empty() {
-            return Err("Driver hasn't been loaded");
+            panic!("Driver hasn't been loaded");
         }
 
         let service_mgr = ScHandle::from_raw_handle(unsafe {
@@ -381,7 +381,7 @@ impl Driver for PE {
         });
 
         if service_mgr.raw().is_invalid() {
-            return Err("Couldn't open handle to service manager");
+            panic!("Couldn't open handle to service manager");
         }
 
         let service = ScHandle::from_raw_handle(unsafe {
@@ -393,36 +393,29 @@ impl Driver for PE {
             .unwrap()
         });
         if service.raw().is_invalid() {
-            return Err("Couldn't open handle to created service");
+            panic!("Couldn't open handle to created service");
         }
 
         let mut success =
             unsafe { ControlService(service.raw(), SERVICE_CONTROL_STOP, &mut sstatus) };
         if !success.as_bool() {
-            return Err("Failed to unload driver");
+            panic!("Failed to unload driver");
         }
 
         success = unsafe { DeleteService(service.raw()) };
         if !success.as_bool() {
-            return Err("Failed to delete service");
+            panic!("Failed to delete service");
         }
 
-        Ok(())
+        Some(())
     }
 }
 
-fn main(){
-    let mut driver = PE::from_disk(&"C:\\Users\\cybea\\source\\repos\\MyDriver1\\x64\\Debug".to_string()).unwrap();
-    driver.load("MyDriver2".to_string());
-    driver.unload();
-
-    assert_eq!(1, 1);
-}
 
 #[cfg(test)]
 mod tests {
-    use crate::PE;
     use crate::Driver;
+    use crate::PE;
     //use std::fs;
 
     #[test]
@@ -439,15 +432,15 @@ mod tests {
         assert_eq!(notepad.name, "notepad.exe".to_string());
     }
 
+   /* 
     #[test]
-    fn driver_works () {
+    fn driver_works() {
         let mut driver = PE::from_disk(&"C:\\Users\\cybea\\source\\repos\\MyDriver1\\x64\\Debug\\MyDriver1.sys".to_string()).unwrap();
-        if let Err(e) = driver.load("MyDriver2".to_string()){
-            panic!("{}", e);
-        }
+        driver.load("MyDriver2");
 
         assert_eq!(driver.provided_driver_name, "MyDriver2".to_string());
     }
+    */
     /* note: image size on disk != image size in memory.
     #[test]
     fn image_size_correct() {
