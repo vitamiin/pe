@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 use std::ffi::{CStr, CString};
-use windows::core::{PCSTR, PSTR};
+use windows::core::PCSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Security::*;
 use windows::Win32::System::Diagnostics::Debug::{
@@ -63,6 +63,8 @@ pub struct PE {
     imported_functions: Vec<(String, String)>, // library_name, function_name
 
     provided_driver_name: String,
+    read_physical_mem: fn(*const c_void, usize) -> Vec<u8>, // r
+    write_physical_mem: fn(*mut c_void, &Vec<u8>, usize),   // w
 }
 
 pub trait Driver {
@@ -278,6 +280,8 @@ impl PE {
             imported_functions: vec![("".to_string(), "".to_string())],
 
             provided_driver_name: "".to_string(),
+            read_physical_mem: |dst, size| -> Vec<u8> { vec![] },
+            write_physical_mem: |dst, src, size| {},
         })
     }
 }
@@ -411,7 +415,6 @@ impl Driver for PE {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::Driver;
@@ -432,7 +435,7 @@ mod tests {
         assert_eq!(notepad.name, "notepad.exe".to_string());
     }
 
-   /* 
+    /*
     #[test]
     fn driver_works() {
         let mut driver = PE::from_disk(&"C:\\Users\\cybea\\source\\repos\\MyDriver1\\x64\\Debug\\MyDriver1.sys".to_string()).unwrap();
