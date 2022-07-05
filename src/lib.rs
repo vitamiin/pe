@@ -118,21 +118,18 @@ pub trait Driver {
 impl PE {
     pub fn from_disk(path: &String) -> Option<Self> {
         let mut image_bytes = std::fs::read(path).unwrap();
-        let pre_dos_header = unsafe {
-            core::mem::transmute::<*const u8, *const IMAGE_DOS_HEADER>(image_bytes.as_ptr()).read()
-        };
+        let pre_dos_header = unsafe { image_bytes.as_ptr().cast::<IMAGE_DOS_HEADER>().read() };
 
         if u32::from(pre_dos_header.e_magic) != IMAGE_DOS_SIGNATURE {
             panic!("image signature corrupt");
         }
 
         let pre_nt_headers = unsafe {
-            core::mem::transmute::<*const u8, *const IMAGE_NT_HEADERS64>(
-                image_bytes
-                    .as_ptr()
-                    .offset(pre_dos_header.e_lfanew.try_into().unwrap()),
-            )
-            .read()
+            image_bytes
+                .as_ptr()
+                .offset(pre_dos_header.e_lfanew.try_into().unwrap())
+                .cast::<IMAGE_NT_HEADERS64>()
+                .read()
         };
         if pre_nt_headers.Signature != IMAGE_NT_SIGNATURE {
             panic!("image signature corrupt");
@@ -163,16 +160,15 @@ impl PE {
         let section_count = pre_nt_headers.FileHeader.NumberOfSections;
         let _section_headers = unsafe {
             std::slice::from_raw_parts(
-                core::mem::transmute::<*const u8, *const IMAGE_SECTION_HEADER>(
-                    image_bytes
-                        .as_ptr()
-                        .offset(pre_dos_header.e_lfanew.try_into().unwrap())
-                        .offset(
-                            core::mem::size_of::<IMAGE_NT_HEADERS64>()
-                                .try_into()
-                                .unwrap(),
-                        ),
-                ),
+                image_bytes
+                    .as_ptr()
+                    .offset(pre_dos_header.e_lfanew.try_into().unwrap())
+                    .offset(
+                        core::mem::size_of::<IMAGE_NT_HEADERS64>()
+                            .try_into()
+                            .unwrap(),
+                    )
+                    .cast::<IMAGE_SECTION_HEADER>(),
                 section_count.into(),
             )
         };
@@ -195,18 +191,16 @@ impl PE {
 
         image_bytes.clear();
 
-        let dos_header = unsafe {
-            core::mem::transmute::<*const c_void, *const IMAGE_DOS_HEADER>(image_base).read()
-        };
+        let dos_header = unsafe { image_base.cast::<IMAGE_DOS_HEADER>().read() };
         if u32::from(dos_header.e_magic) != IMAGE_DOS_SIGNATURE {
             panic!("image signature corrupt");
         }
 
         let nt_headers = unsafe {
-            core::mem::transmute::<*const c_void, *const IMAGE_NT_HEADERS64>(
-                image_base.offset(dos_header.e_lfanew.try_into().unwrap()),
-            )
-            .read()
+            image_base
+                .offset(dos_header.e_lfanew.try_into().unwrap())
+                .cast::<IMAGE_NT_HEADERS64>()
+                .read()
         };
         if nt_headers.Signature != IMAGE_NT_SIGNATURE {
             panic!("image signature corrupt");
@@ -215,36 +209,35 @@ impl PE {
         let file_header = nt_headers.FileHeader;
         let optional_header = nt_headers.OptionalHeader;
         let section_headers = unsafe {
-            core::mem::transmute::<*const c_void, *const IMAGE_SECTION_HEADER>(
-                image_base
-                    .offset(pre_dos_header.e_lfanew.try_into().unwrap())
-                    .offset(
-                        core::mem::size_of::<IMAGE_NT_HEADERS64>()
-                            .try_into()
-                            .unwrap(),
-                    ),
-            )
+            image_base
+                .offset(pre_dos_header.e_lfanew.try_into().unwrap())
+                .offset(
+                    core::mem::size_of::<IMAGE_NT_HEADERS64>()
+                        .try_into()
+                        .unwrap(),
+                )
+                .cast::<IMAGE_SECTION_HEADER>()
         };
 
         let export_address_table = unsafe {
-            core::mem::transmute::<*const c_void, *const IMAGE_EXPORT_DIRECTORY>(
-                image_base.offset(
+            image_base
+                .offset(
                     optional_header.DataDirectory[0]
                         .VirtualAddress
                         .try_into()
                         .unwrap(),
-                ),
-            )
+                )
+                .cast::<IMAGE_EXPORT_DIRECTORY>()
         };
         let import_address_table = unsafe {
-            core::mem::transmute::<*const c_void, *const IMAGE_IMPORT_DESCRIPTOR>(
-                image_base.offset(
+            image_base
+                .offset(
                     optional_header.DataDirectory[1]
                         .VirtualAddress
                         .try_into()
                         .unwrap(),
-                ),
-            )
+                )
+                .cast::<IMAGE_IMPORT_DESCRIPTOR>()
         };
 
         let image_name = unsafe {
