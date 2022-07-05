@@ -3,16 +3,13 @@ use std::ffi::{CStr, CString};
 use windows::core::PCSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Security::*;
-use windows::Win32::System::Diagnostics::Debug::{
-    IMAGE_FILE_HEADER, IMAGE_NT_HEADERS64, IMAGE_OPTIONAL_HEADER64, IMAGE_SECTION_HEADER,
-};
+use windows::Win32::System::Diagnostics::Debug::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Services::*;
-use windows::Win32::System::SystemServices::{
-    IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_EXPORT_DIRECTORY, IMAGE_IMPORT_DESCRIPTOR,
-    IMAGE_NT_SIGNATURE, SE_LOAD_DRIVER_NAME,
-};
+use windows::Win32::System::SystemServices::*;
 use windows::Win32::System::Threading::*;
+
+const SMALLEST_PE_SIZE64: usize = 268;
 
 struct ScHandle {
     h: SC_HANDLE,
@@ -115,7 +112,7 @@ pub trait Driver {
     }
 
     fn load(&mut self, driver_name: &str) -> Option<()>;
-    fn unload(&self) -> Option<()>;
+    fn unload(&mut self) -> Option<()>;
 }
 
 impl PE {
@@ -142,13 +139,16 @@ impl PE {
         }
 
         let image_size = pre_nt_headers.OptionalHeader.SizeOfImage as usize;
+        // the 16 bytes at the start are for potential shellcode space
+        // (for the shellcode conversion function)
         let image_base = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
-                image_size.try_into().unwrap(),
+                (16 + image_size).try_into().unwrap(),
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_EXECUTE_READWRITE,
             )
+            .add(16)
         };
         let headers_size = pre_nt_headers.OptionalHeader.SizeOfHeaders;
         // copying image headers to allocated virtual memory
@@ -251,6 +251,7 @@ impl PE {
             match (*export_address_table).Name {
                 // in case the image has a hollow EAT
                 0xffff => path.rsplit("\\").collect::<Vec<&str>>()[0].to_string(),
+                0 => path.rsplit("\\").collect::<Vec<&str>>()[0].to_string(),
                 _ => CStr::from_ptr(
                     image_base.offset((*export_address_table).Name.try_into().unwrap())
                         as *const i8,
@@ -260,6 +261,8 @@ impl PE {
                 .to_string(),
             }
         };
+
+        unsafe { PE::perform_relocations(image_base, optional_header) };
 
         Some(PE {
             name: image_name,
@@ -284,14 +287,157 @@ impl PE {
             write_physical_mem: |dst, src, size| {},
         })
     }
+
+    // perform necessary reloactions for absolute addresses
+    unsafe fn perform_relocations(
+        image_base: *mut c_void,
+        optional_header: IMAGE_OPTIONAL_HEADER64,
+    ) {
+        // acquire delta between actual base addr and wanted base addr
+        let delta = image_base.sub(optional_header.ImageBase as usize);
+        if !delta.is_null() {
+            let mut base_relocation = image_base
+                .add(
+                    optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC.0 as usize]
+                        .VirtualAddress as usize,
+                )
+                .cast::<IMAGE_BASE_RELOCATION>();
+
+            // make sure we have control over base_relocation before
+            // dereferencing
+            let mut mem_permissions = MEMORY_BASIC_INFORMATION::default();
+            VirtualQuery(
+                base_relocation.cast::<c_void>(),
+                &mut mem_permissions,
+                (*base_relocation).SizeOfBlock.try_into().unwrap(),
+            );
+
+            while mem_permissions.Protect != PAGE_NOACCESS
+                && mem_permissions.Protect != PAGE_EXECUTE
+            {
+                // no addresses to fix at this block
+                if (*base_relocation).SizeOfBlock
+                    == core::mem::size_of::<IMAGE_BASE_RELOCATION>()
+                        .try_into()
+                        .unwrap()
+                {
+                    base_relocation = base_relocation.add((*base_relocation).SizeOfBlock as usize);
+                    continue;
+                }
+
+                // amount of addresses whice need relocation
+                let reloc_count = ((*base_relocation).SizeOfBlock as isize
+                    - (core::mem::size_of::<IMAGE_BASE_RELOCATION>() as isize))
+                    / (core::mem::size_of::<i16>() as isize);
+                // array of offsets from base of page
+                let reloc_offsets = std::slice::from_raw_parts(
+                    base_relocation
+                        .add(core::mem::size_of::<IMAGE_BASE_RELOCATION>())
+                        .cast::<u16>(),
+                    reloc_count as usize,
+                );
+
+                for reloc_index in 0..reloc_count {
+                    *image_base
+                        .add((*base_relocation).VirtualAddress.try_into().unwrap())
+                        .add((reloc_offsets[reloc_index as usize] & 0xfff).into())
+                        .cast::<u64>() += delta as u64;
+                }
+
+                // if size of block is 0, there's no subsequent block
+                if (*base_relocation).SizeOfBlock == 0 {
+                    break;
+                }
+                VirtualQuery(
+                    base_relocation
+                        .add((*base_relocation).SizeOfBlock as usize)
+                        .cast::<c_void>(),
+                    &mut mem_permissions,
+                    (*base_relocation).SizeOfBlock.try_into().unwrap(),
+                );
+                base_relocation = base_relocation.add((*base_relocation).SizeOfBlock as usize);
+            }
+        }
+    }
+
+    /// returns the virtual address for the program's entry point
+    pub fn entry_point(&self) -> *const c_void {
+        unsafe {
+            self.image_base
+                .add(self.optional_header.AddressOfEntryPoint as usize)
+        }
+    }
+
+    /// returns the relative virtual address for the program's entry point
+    pub fn entry_point_rel(&self) -> u32 {
+        self.optional_header.AddressOfEntryPoint
+    }
+    /// determines whether the image is 64 bit or not
+    pub fn is_64bit(&self) -> bool {
+        if self.optional_header.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            return true;
+        }
+        false
+    }
+
+    /// returns the architecture which the PE was compiled for
+    pub fn arch(&self) -> IMAGE_FILE_MACHINE {
+        self.file_header.Machine
+    }
+
+    // NOTE: can only work with completely PIC, dependency-free EXEs
+    // with a custom entry point
+    /// converts the PE to runnable(ish) 64-bit shellcode with constraints
+    pub fn convert_to_shellcode_64(&self) -> &[u8] {
+        let mut shellcode: [u8; 16] = [0; 16];
+        let offset_to_entry_point = 18 + self.entry_point_rel();
+
+        // lea rax, [rip]
+        shellcode[0] = 0x48;
+        shellcode[1] = 0x8d;
+        shellcode[2] = 0x05;
+        shellcode[3] = 0x00;
+        shellcode[4] = 0x00;
+        shellcode[5] = 0x00;
+        shellcode[6] = 0x00;
+        // add rax, offset_to_entry_point_from_rip
+        shellcode[7] = 0x48;
+        shellcode[8] = 0x05;
+        // writing offset_to_entry_point_from_rip into buffer
+        unsafe {
+            std::ptr::write(
+                (&mut shellcode[9] as *mut u8).cast::<u32>(),
+                offset_to_entry_point,
+            )
+        };
+
+        // call rax (calling custom entry point of import-independent PE)
+        shellcode[13] = 0xff;
+        shellcode[14] = 0xd0;
+
+        // copy shellcode to pre-allocated space before image_base
+        unsafe {
+            std::ptr::copy(
+                shellcode.as_ptr(),
+                self.image_base.sub(16).cast::<u8>(),
+                shellcode.len(),
+            )
+        };
+
+        unsafe { std::slice::from_raw_parts(self.image_base.sub(16).cast::<u8>(), self.size + 16) }
+    }
 }
 
 impl Drop for PE {
     fn drop(&mut self) {
-        if !self.image_base.is_null() {
+        let mut mem_permissions = MEMORY_BASIC_INFORMATION::default();
+        unsafe { VirtualQuery(self.image_base, &mut mem_permissions, SMALLEST_PE_SIZE64) };
+
+        // if image_base is valid and wasn't freed prior
+        if !self.image_base.is_null() && mem_permissions.Protect != PAGE_NOACCESS {
             unsafe { VirtualFree(self.image_base, 0, MEM_RELEASE) };
         }
-
+        // if driver has been loaded
         if self.provided_driver_name != "".to_string() {
             self.unload();
         }
@@ -368,7 +514,7 @@ impl Driver for PE {
         Some(())
     }
 
-    fn unload(&self) -> Option<()> {
+    fn unload(&mut self) -> Option<()> {
         let mut sstatus = SERVICE_STATUS::default();
 
         if self.provided_driver_name.is_empty() {
@@ -411,6 +557,7 @@ impl Driver for PE {
             panic!("Failed to delete service");
         }
 
+        self.provided_driver_name = "".to_string();
         Some(())
     }
 }
@@ -419,12 +566,19 @@ impl Driver for PE {
 mod tests {
     use crate::Driver;
     use crate::PE;
+    use std::arch::asm;
     //use std::fs;
-
     #[test]
     fn image_name_matches() {
         let nlmproxy = PE::from_disk(&"C:\\Windows\\system32\\nlmproxy.dll".to_string()).unwrap();
         assert_eq!(nlmproxy.name, "nlmproxy.dll".to_string());
+    }
+
+    #[test]
+    fn image_64bit_check_success() {
+        let nlmproxy = PE::from_disk(&"C:\\Windows\\system32\\nlmproxy.dll".to_string()).unwrap();
+        let drt = PE::from_disk(&"C:\\Windows\\SysWOW64\\drt.dll".to_string()).unwrap();
+        assert!(nlmproxy.is_64bit() && !drt.is_64bit());
     }
 
     // a different method is used for getting the image name from an EXE,
@@ -434,21 +588,4 @@ mod tests {
         let notepad = PE::from_disk(&"C:\\Windows\\system32\\notepad.exe".to_string()).unwrap();
         assert_eq!(notepad.name, "notepad.exe".to_string());
     }
-
-    /*
-    #[test]
-    fn driver_works() {
-        let mut driver = PE::from_disk(&"C:\\Users\\cybea\\source\\repos\\MyDriver1\\x64\\Debug\\MyDriver1.sys".to_string()).unwrap();
-        driver.load("MyDriver2");
-
-        assert_eq!(driver.provided_driver_name, "MyDriver2".to_string());
-    }
-    */
-    /* note: image size on disk != image size in memory.
-    #[test]
-    fn image_size_correct() {
-        let notepad = PE::from_disk(&"C:\\Windows\\system32\\notepad.exe".to_string()).unwrap();
-        assert_eq!(fs::metadata("C:\\Windows\\system32\\notepad.exe").unwrap().len(), notepad.image_size as u64);
-    }
-    */
 }
